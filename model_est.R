@@ -19,13 +19,13 @@ gs_candidates_s  <- 4:7     # candidate GS starts (Apr–Jul)
 gs_candidates_e  <- 8:10    # candidate GS ends   (Aug–Oct)
 climate_baseline <- 1981:2018 # normals window for MG penalty (pick explicitly)
 # Expecting NASS-style columns: Year, Value, State.ANSI, County.ANSI, (maybe fips)
-yld <- fread("sugarbeet_yields.csv")
+yld <- fread("sunflower_yields_1980_2024.csv")
 yld$State.ANSI = yld$"State ANSI"
 yld$County.ANSI = yld$"County ANSI"
 yld[, Value := as.numeric(gsub("[^0-9.\\-]", "", Value))]
 yld$yield = log(as.numeric(yld$Value))
 yld$fips = 1000*as.integer(yld$"State.ANSI") + as.integer(yld$"County.ANSI")
-yld <- yld[yld$State %in% c("MICHIGAN","MINNESOTA","MONTANA","NEBRASKA","NORTH DAKOTA"),]
+yld <- yld[yld$State %in% c("MICHIGAN","MINNESOTA","MONTANA","NEBRASKA","NORTH DAKOTA","SOUTH DAKOTA","IDAHO"),]
 # Year as numeric
 if (!("year" %in% names(yld))) {
   if ("Year" %in% names(yld)) yld[, year := as.integer(Year)] else stop("No 'year' or 'Year' column in yield file.")
@@ -217,14 +217,16 @@ clim_norms <- dw_norm |>
   dplyr::group_by(fips) |>
   dplyr::summarise(
     clim_gs_tavg = mean(gs_tavg, na.rm = TRUE),
-    clim_ppt     = mean(ppt,    na.rm = TRUE)
+    clim_ppt     = mean(ppt,    na.rm = TRUE),
+    clim_gs_heat = mean(bin5_35_50, na.rm = TRUE),
+    
   ) |>
   as.data.frame()
 
 df_mg <- merge(df, clim_norms, by = "fips", all.x = TRUE)
 
 # --- Merel–Gammans penalties: squared deviations from climate averages ---
-df_mg$pen_temp <- (df_mg$gs_tavg - df_mg$clim_gs_tavg)^2
+df_mg$pen_temp <- (df_mg$bin5_35_50 - df_mg$clim_gs_heat)^2
 df_mg$pen_ppt  <- (df_mg$ppt    - df_mg$clim_ppt    )^2
 
 # penalties
@@ -233,7 +235,7 @@ df_mg$gs_tavg2 <- df_mg$gs_tavg^2
 
 
 # MG model = avg-T/P model + penalties
-fml_mg <- yield ~ gs_tavg +gs_tavg2+ ppt  + ppt2 +pen_temp + pen_ppt +year | fips   
+fml_mg <- yield ~ gs_tavg +bin5_35_50+ ppt  + ppt2 +pen_temp + pen_ppt +year | fips   
 mod_mg <- fixest::feols(fml_mg, data = df_mg,  cluster = ~ State.ANSI)
 
 cat("\n=== Avg-T + Precip with Merel–Gammans penalty ===\n")
