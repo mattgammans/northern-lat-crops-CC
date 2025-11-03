@@ -1,22 +1,28 @@
 # ============================================================
-# Multi-season CV with constrained temperature specs
-# Splits: S3 (4-6,7,8-10), S2A (4-6,7-10), S1 (4-10)
-# Temp per season: none, gdd5_30, gdd10_30, gdd5_28, gdd10_28, bin5C_10
-#  - Constraint: in a candidate, all non-NONE seasons share the same temp spec
-# PPT per season: none, quad (independent by season)
-# Scoring: SKILL vs baseline yield ~ t + i(State.ANSI, t) | fips
+# Multi-season CV (S1, S2A only) with constrained specs
+# - Temp: GDD/HDD (bases {5,10}, caps {26..32}) OR 5°C bins (start=10)
+# - S2A forbids mixing (both seasons GDD or both bins)
+# - PPT: ALWAYS quadratic for all seasons in the split
+# - Metrics: median skill, trimmed mean (drop top2 & bottom2), mean
+# Baseline: yield ~ t + i(State.ANSI, t) | fips
 # ============================================================
 
 suppressPackageStartupMessages({ library(data.table); library(fixest) })
 
 # -----------------------------
-# PATHS / SETTINGS (edit if needed)
+# PATHS / SETTINGS
 # -----------------------------
 root <- "/Users/gammansm/Dropbox/NorthernLatitudeCrops_CCimpacts/Data"
 bins_csv  <- file.path(root, "USco_PRISM_bins_monthly_1981_2022_cropland.csv")
 weath_csv <- file.path(root, "USco_PRISM_weather_monthly_1981_2022_cropland.csv")
-years_use <- c(1981:2019, 2021:2022)
+years_use <- c(1981:2022)
+
+# Northern-state filter you used earlier (adjust if you want SD=46 included)
 filt_states_north <- c(8,16,26,27,30,31,38,39,41,53,56)
+
+# GDD/HDD grids under the new constraints
+gdd_base_grid <- c(5, 10)
+hdd_cap_grid  <- 26:32
 
 # -----------------------------
 # LOAD WEATHER
@@ -28,19 +34,13 @@ stopifnot(all(c("fips","year","month") %in% names(weatherdata)))
 tempbinsdata[, `:=`(fips=as.integer(fips), year=as.integer(year), month=as.integer(month))]
 weatherdata[,  `:=`(fips=as.integer(fips), year=as.integer(year), month=as.integer(month))]
 
-# ============================================================
-# Fast precompute + caching (weather features across crops)
-# + baseline-prediction cache for LOYO
-# ============================================================
+ppt_col <- intersect(c("ppt","ppt_mm","prcp_mm","precip_mm","prcp"), names(weatherdata))
+if (!length(ppt_col)) stop("Monthly weather must include a precip column.")
+setnames(weatherdata, ppt_col[1], "ppt")
 
-suppressPackageStartupMessages({
-  library(data.table)
-  library(fixest)
-})
-
-# -----------------------------
+# ============================================================
 # Helpers
-# -----------------------------
+# ============================================================
 ensure_state_ansi <- function(DT){
   DT <- as.data.table(DT)
   if (!"State.ANSI" %in% names(DT)) DT[, State.ANSI := as.integer(fips %/% 1000L)]
@@ -59,16 +59,15 @@ disc_bins <- function(TB){
   list(bins = bins[ord], k = k[ord])
 }
 
-# Monthly GDD/HDD from histogram-of-temp columns (hours -> days)
+# Monthly GDD/HDD (hours -> days)
 make_monthly_gddhdd <- function(tempbins, base, cap){
   stopifnot(all(c("fips","year","month") %in% names(tempbins)))
   DB <- disc_bins(tempbins)
   TB <- as.data.table(tempbins)[, c("fips","year","month", DB$bins), with = FALSE]
-  # numeric + hours -> days
   for (b in DB$bins) {
     TB[, (b) := suppressWarnings(as.numeric(get(b)))]
     TB[is.na(get(b)), (b) := 0]
-    TB[, (b) := get(b) / 24]
+    TB[, (b) := get(b) / 24]  # hours -> days
   }
   Hdy <- as.matrix(TB[, DB$bins, with = FALSE])
   storage.mode(Hdy) <- "double"
@@ -84,53 +83,45 @@ make_monthly_gddhdd <- function(tempbins, base, cap){
   out[]
 }
 
-# Collapse to 5°C groups for selected months; returns county-year wide table
+# Collapse to 5°C groups for selected months; county-year wide
 collapse_bins_5C_by_months <- function(tempbins, months_keep, suffix){
   stopifnot(all(c("fips","year","month") %in% names(tempbins)))
   DB <- disc_bins(tempbins)
   TB <- as.data.table(tempbins)[month %in% months_keep, c("fips","year","month", DB$bins), with = FALSE]
-  # numeric + hours -> days
   for (b in DB$bins) {
     TB[, (b) := suppressWarnings(as.numeric(get(b)))]
     TB[is.na(get(b)), (b) := 0]
-    TB[, (b) := get(b) / 24]
+    TB[, (b) := get(b) / 24]  # hours -> days
   }
-  # Map each fine bin to a 5°C group label
   g5 <- floor(DB$k / 5) * 5
-  groups <- split(DB$bins, g5)  # list: names are group labels
-  # Sum across member columns, then sum over months -> county-year
+  groups <- split(DB$bins, g5)
   summed <- TB[, {
-    # per-row rowSums for each 5C group
     sums <- lapply(groups, function(cols) rowSums(.SD[, ..cols], na.rm = TRUE))
     as.data.table(sums)
   }, by = .(fips, year)]
-  # Now collapse (if multiple months) to county-year totals
   wide <- summed[, lapply(.SD, sum, na.rm = TRUE), by = .(fips, year)]
-  # Rename columns to bin5C_<g>_<suffix>
   gnames <- names(groups)
   setnames(wide, old = gnames, new = paste0("bin5C_", gnames, "_", suffix))
   wide[]
 }
 
-# -----------------------------
-# Global caches live across crops
-# -----------------------------
-.dd_cache    <- new.env(parent = emptyenv())  # monthly GDD/HDD for (base, cap)
-.bin5_cache  <- new.env(parent = emptyenv())  # 5°C bins per season window
-.ppt_cache   <- new.env(parent = emptyenv())  # PPT per season window
-.baseline_cache <- new.env(parent = emptyenv())  # LOYO baseline predictions per crop/fold
+# ============================================================
+# CACHES (shared across crops)
+# ============================================================
+.dd_cache       <- new.env(parent = emptyenv())  # monthly GDD/HDD per (base, cap)
+.bin5_cache     <- new.env(parent = emptyenv())  # 5°C bins per season window
+.ppt_cache      <- new.env(parent = emptyenv())  # PPT per season window
+.baseline_cache <- new.env(parent = emptyenv())  # LOYO baseline preds per crop/fold
 
-key_dd   <- function(base, cap)     paste0("dd::", base, "_", cap)
-key_bins <- function(season_name)   paste0("bin5::", season_name)
-key_ppt  <- function(season_name)   paste0("ppt::", season_name)
-fold_key <- function(crop, yrs)     paste0(crop, "::", paste(sort(as.integer(yrs)), collapse=","))
+key_dd   <- function(base, cap)   paste0("dd::", base, "_", cap)
+key_bins <- function(season)      paste0("bin5::", season)
+key_ppt  <- function(season)      paste0("ppt::", season)
+fold_key <- function(crop, yrs)   paste0(crop, "::", paste(sort(as.integer(yrs)), collapse=","))
 
-# -----------------------------
 # Precompute monthly DD/HDD for all (base, cap)
-# -----------------------------
 precompute_dd <- function(tempbins){
-  for (base in c(5, 10)) {
-    for (cap in c(28, 30, 32)) {
+  for (base in gdd_base_grid) {
+    for (cap in hdd_cap_grid) {
       k <- key_dd(base, cap)
       if (!exists(k, .dd_cache, inherits = FALSE)) {
         assign(k, make_monthly_gddhdd(tempbins, base, cap), .dd_cache)
@@ -139,11 +130,9 @@ precompute_dd <- function(tempbins){
   }
 }
 
-# -----------------------------
 # Precompute 5°C bins per season window
-# -----------------------------
 precompute_bin5 <- function(tempbins){
-  windows <- list(SPRING = 4:6, JULY = 7, LATE = 8:10, SUMMER = 7:10, ALL = 4:10)
+  windows <- list(SPRING = 4:6, SUMMER = 7:10, ALL = 4:10)
   for (nm in names(windows)){
     k <- key_bins(nm)
     if (!exists(k, .bin5_cache, inherits = FALSE)) {
@@ -152,14 +141,12 @@ precompute_bin5 <- function(tempbins){
   }
 }
 
-# -----------------------------
-# Precompute PPT per season window (expects weather$ppt numeric)
-# -----------------------------
+# Precompute PPT per season window (always quadratic later)
 precompute_ppt <- function(weather){
   stopifnot(all(c("fips","year","month","ppt") %in% names(weather)))
   W <- as.data.table(weather)
   W[, ppt := as.numeric(ppt)]; W[is.na(ppt), ppt := 0]
-  windows <- list(SPRING = 4:6, JULY = 7, LATE = 8:10, SUMMER = 7:10, ALL = 4:10)
+  windows <- list(SPRING = 4:6, SUMMER = 7:10, ALL = 4:10)
   for (nm in names(windows)){
     k <- key_ppt(nm)
     if (!exists(k, .ppt_cache, inherits = FALSE)) {
@@ -171,45 +158,50 @@ precompute_ppt <- function(weather){
 }
 
 # -----------------------------
-# Build features for a candidate spec using caches
-# split: "S3" = SPRING/JULY/LATE; "S2A" = SPRING/SUMMER; "S1" = ALL
-# temp_assign: named list per season -> one of
-#   "none", "gdd5_28", "gdd5_30", "gdd10_28", "gdd10_30", "bin5C_10"
-# ppt_assign:  named list per season -> one of "none", "quad"
+# Parse a "gdd{base}_{cap}" string
 # -----------------------------
-build_candidate_features <- function(split, temp_assign, ppt_assign){
-  if (split == "S3")  seas <- list(SPRING = 4:6, JULY = 7, LATE = 8:10)
-  if (split == "S2A") seas <- list(SPRING = 4:6, SUMMER = 7:10)
-  if (split == "S1")  seas <- list(ALL = 4:10)
+parse_gdd_spec <- function(spec){
+  m <- regexec("^gdd(\\d+)_(\\d+)$", spec)
+  mm <- regmatches(spec, m)[[1]]
+  if (length(mm) != 3) stop("Bad GDD spec: ", spec)
+  list(base = as.integer(mm[2]), cap = as.integer(mm[3]))
+}
+
+# -----------------------------
+# Build features for a candidate
+# split: "S2A" (SPRING/SUMMER) or "S1" (ALL)
+# temp_assign: named list per season: either "bin5C_10" OR "gdd{base}_{cap}"
+# Always append PPT_<season> and squared
+# -----------------------------
+build_candidate_features <- function(split, temp_assign){
+  if (split == "S2A") seasons <- c("SPRING","SUMMER")
+  if (split == "S1")  seasons <- c("ALL")
   feats <- list()
   
-  # Temperature blocks from caches
-  for (sn in names(seas)){
+  # Temperature blocks
+  for (sn in seasons){
     spec <- temp_assign[[sn]]
-    if (is.null(spec) || is.na(spec) || spec == "none") next
+    if (is.null(spec)) next
     
-    if (startsWith(spec, "gdd")) {
-      base <- if (grepl("^gdd5",  spec)) 5 else 10
-      cap  <- if (grepl("_30$",  spec)) 30 else 28
-      DD   <- get(key_dd(base, cap), .dd_cache)
-      # sum within this season
-      agg <- DD[month %in% seas[[sn]], .(GDD = sum(GDD_mon), HDD = sum(HDD_mon)), by = .(fips, year)]
+    if (spec == "bin5C_10"){
+      feats[[length(feats) + 1L]] <- get(key_bins(sn), .bin5_cache)
+    } else if (grepl("^gdd\\d+_\\d+$", spec)) {
+      pp <- parse_gdd_spec(spec)
+      DD <- get(key_dd(pp$base, pp$cap), .dd_cache)
+      months <- if (sn == "SPRING") 4:6 else if (sn == "SUMMER") 7:10 else 4:10
+      agg <- DD[month %in% months, .(GDD = sum(GDD_mon), HDD = sum(HDD_mon)), by = .(fips, year)]
       setnames(agg, c("GDD","HDD"), c(paste0("GDD_", sn), paste0("HDD_", sn)))
-      feats[[length(feats) + 1]] <- agg
-      
-    } else if (spec == "bin5C_10") {
-      # pre-collapsed 5C groups for this season
-      feats[[length(feats) + 1]] <- get(key_bins(sn), .bin5_cache)
+      feats[[length(feats) + 1L]] <- agg
+    } else {
+      stop("Unknown temp spec: ", spec)
     }
   }
   
-  # PPT blocks from caches
-  for (sn in names(seas)){
-    pps <- ppt_assign[[sn]]
-    if (is.null(pps) || is.na(pps) || pps == "none") next
+  # Always add PPT (linear + quadratic) for all seasons in the split
+  for (sn in seasons){
     P <- get(key_ppt(sn), .ppt_cache)
     set(P, j = paste0("PPT_", sn, "_sq"), value = P[[paste0("PPT_", sn)]]^2)
-    feats[[length(feats) + 1]] <- P
+    feats[[length(feats) + 1L]] <- P
   }
   
   if (!length(feats)) return(data.table(fips = integer(), year = integer()))
@@ -219,7 +211,41 @@ build_candidate_features <- function(split, temp_assign, ppt_assign){
 }
 
 # -----------------------------
-# Baseline prediction cache for LOYO
+# RHS builder from available columns
+# -----------------------------
+build_rhs_terms <- function(df_names, split, temp_assign){
+  rhs <- character(0)
+  seasons <- if (split == "S2A") c("SPRING","SUMMER") else "ALL"
+  
+  # Temperature terms
+  for (sn in seasons){
+    spec <- temp_assign[[sn]]
+    if (spec == "bin5C_10"){
+      suf <- tolower(sn)
+      bn <- grep(paste0("^bin5C_(-?\\d+)_", suf, "$"), df_names, value = TRUE)
+      if (length(bn)) {
+        centers <- as.integer(sub(paste0("^bin5C_(-?\\d+)_", suf, "$"), "\\1", bn))
+        bn <- bn[centers >= 10]              # start at 10°C by design
+        if (length(bn)) rhs <- c(rhs, sprintf("`%s`", bn))
+      }
+    } else if (grepl("^gdd\\d+_\\d+$", spec)) {
+      for (nm in c(paste0("GDD_", sn), paste0("HDD_", sn))){
+        if (nm %in% df_names) rhs <- c(rhs, nm)
+      }
+    }
+  }
+  
+  # Always add PPT blocks
+  for (sn in seasons){
+    v <- paste0("PPT_", sn)
+    if (v %in% df_names) rhs <- c(rhs, v, sprintf("I(%s^2)", v))
+  }
+  
+  if (!length(rhs)) "0" else paste(rhs, collapse = " + ")
+}
+
+# -----------------------------
+# LOYO SKILL (adds trimmed mean)
 # -----------------------------
 get_baseline_preds <- function(crop_slug, tr, te){
   k <- fold_key(crop_slug, unique(te$year))
@@ -230,79 +256,6 @@ get_baseline_preds <- function(crop_slug, tr, te){
   pb
 }
 
-
-# ============================================================
-# Candidate enumeration + LOYO CV loops + save outputs
-# ============================================================
-
-suppressPackageStartupMessages({ library(data.table); library(fixest) })
-
-# ---------- Splits and menus ----------
-season_splits <- list(
-  S3  = c("SPRING","JULY","LATE"),  # Apr–Jun, Jul, Aug–Oct
-  S2A = c("SPRING","SUMMER"),       # Apr–Jun, Jul–Oct
-  S1  = c("ALL")                    # Apr–Oct
-)
-
-# Temperature menu (identical type across non‑NONE seasons)
-temp_types <- c("none", "gdd5_30","gdd10_30","gdd5_28","gdd10_28","bin5C_10")
-
-# PPT menu (per season)
-ppt_menu <- c("none","quad")
-
-# ---------- Utilities ----------
-# Power set (list of all subsets) of a character vector 'x'
-all_subsets <- function(x, include_empty = TRUE){
-  out <- list(character(0))
-  if (length(x) == 0L) return(if (include_empty) out else list())
-  for (el in x){
-    out <- c(out, lapply(out, function(s) c(s, el)))
-  }
-  if (!include_empty) out <- Filter(length, out)
-  out
-}
-
-# Build RHS term string from a merged df (so we can see which columns exist)
-build_rhs_terms <- function(df_names, split_name, temp_assign, ppt_assign){
-  rhs <- character(0)
-  
-  # Temperature terms
-  for (sn in names(temp_assign)){
-    spec <- temp_assign[[sn]]
-    if (is.null(spec) || spec == "none") next
-    if (startsWith(spec, "gdd")) {
-      for (nm in c(paste0("GDD_", sn), paste0("HDD_", sn))){
-        if (nm %in% df_names) rhs <- c(rhs, nm)
-      }
-    } else if (spec == "bin5C_10") {
-      suf <- tolower(sn)
-      # keep 5°C groups with center >= 10 (bin5C_<center>_<suffix>)
-      bn <- grep(paste0("^bin5C_(-?\\d+)_", suf, "$"), df_names, value = TRUE)
-      if (length(bn)) {
-        centers <- as.integer(sub(paste0("^bin5C_(-?\\d+)_", suf, "$"), "\\1", bn))
-        keep <- centers >= 10
-        bn <- bn[keep]
-        # drop zero-variance columns if any
-        # (we don't have the data here; defensive check happens at fit time)
-        rhs <- c(rhs, sprintf("`%s`", bn))
-      }
-    }
-  }
-  
-  # PPT terms
-  for (sn in names(ppt_assign)){
-    ps <- ppt_assign[[sn]]
-    if (is.null(ps) || ps == "none") next
-    v <- paste0("PPT_", sn)
-    if (v %in% df_names){
-      rhs <- c(rhs, v, sprintf("I(%s^2)", v))
-    }
-  }
-  
-  if (!length(rhs)) return("0") else paste(rhs, collapse = " + ")
-}
-
-# LOYO skill vs baseline (uses baseline cache)
 loyo_skill_df <- function(crop_slug, df, rhs_string, min_train = 30, min_test = 10){
   DT <- as.data.table(df)
   yrs <- sort(unique(DT$year))
@@ -313,18 +266,19 @@ loyo_skill_df <- function(crop_slug, df, rhs_string, min_train = 30, min_test = 
     te <- copy(DT[year == yv])
     if (nrow(tr) < min_train || nrow(te) < min_test) next
     
-    # center time on TRAIN
+    # center t on TRAIN
     t0 <- mean(tr$year, na.rm = TRUE)
-    tr[, t := year - t0]; te[, t := year - t0]
+    tr[, t := year - t0]
+    te[, t := year - t0]
     
-    # --- baseline (cached) ---
+    # baseline (cached)
     pb <- get_baseline_preds(crop_slug, tr, te)
     
-    # --- candidate ---
+    # candidate
     fml <- as.formula(paste0("yield ~ t + i(State.ANSI, t) + ", rhs_string, " | fips"))
-    fit <- tryCatch(feols(fml, data = tr, cluster = ~ State.ANSI),
-                    error = function(e) NULL)
+    fit <- tryCatch(feols(fml, data = tr, cluster = ~ State.ANSI), error = function(e) NULL)
     if (is.null(fit)) next
+    
     pm <- tryCatch(predict(fit, newdata = te, fixef = FALSE),
                    error = function(e) rep(NA_real_, nrow(te)))
     
@@ -337,28 +291,44 @@ loyo_skill_df <- function(crop_slug, df, rhs_string, min_train = 30, min_test = 
     }
   }
   
+  # trimmed mean: drop 2 highest and 2 lowest folds if possible
+  mean_trim2 <- if (length(skills) > 4) {
+    xs <- sort(skills)
+    mean(xs[(2+1):(length(xs)-2)])
+  } else {
+    mean(skills)
+  }
+  
   list(skills = skills,
        median_skill = if (length(skills)) median(skills) else -Inf,
-       mean_skill   = if (length(skills)) mean(skills)   else -Inf)
+       mean_trim2   = if (length(skills)) mean_trim2 else -Inf,
+       mean_skill   = if (length(skills)) mean(skills) else -Inf)
 }
 
-# Count total candidates (for a split) given the rules
-count_candidates_for_split <- function(seasons){
-  # Temperature:
-  #  - one "all NONE" candidate
-  #  - for each non-NONE type (5 types), choose any non-empty subset of seasons for which it's applied
-  n_temp <- 1 + 5 * (2^length(seasons) - 1)
-  # PPT: each season picks independently in {none, quad}
-  n_ppt  <- 2^length(seasons)
-  n_temp * n_ppt
+# -----------------------------
+# Candidate counting & enumeration (under constraints)
+# -----------------------------
+season_splits <- list(
+  S2A = c("SPRING","SUMMER"),   # Apr–Jun, Jul–Oct
+  S1  = c("ALL")                # Apr–Oct
+)
+
+count_candidates <- function(){
+  s1_gdd  <- length(gdd_base_grid) * length(hdd_cap_grid)        # 14
+  s1_bins <- 1
+  s2_gdd  <- (length(gdd_base_grid) * length(hdd_cap_grid))^2    # 196
+  s2_bins <- 1
+  s1_gdd + s1_bins + s2_gdd + s2_bins
 }
 
-# ---------- CV runner ----------
+# -----------------------------
+# CV runner
+# -----------------------------
 run_cv_multiseason <- function(yld_raw, crop_slug, save_dir, years_use,
                                keep_states = filt_states_north,
                                verbose = TRUE){
   
-  # restrict outcome
+  # Restrict outcome
   Y <- copy(as.data.table(yld_raw))
   Y <- Y[year %in% years_use]
   Y <- ensure_state_ansi(Y)
@@ -366,90 +336,125 @@ run_cv_multiseason <- function(yld_raw, crop_slug, save_dir, years_use,
   Y <- Y[, .(fips, year, yield, State.ANSI)]
   if (nrow(Y) < 120) stop("Too few rows after filtering for ", crop_slug)
   
-  # pre-count total candidates
-  totals <- sapply(season_splits, count_candidates_for_split)
-  total_candidates <- sum(totals)
-  
+  total_candidates <- count_candidates()
   if (verbose){
-    cat(sprintf("\n######### %s — Multi-season CV ##########\n", toupper(crop_slug)))
+    cat(sprintf("\n######### %s — CV (S1 & S2A only) ##########\n", toupper(crop_slug)))
     cat("Total candidates: ", total_candidates, "\n", sep = "")
   }
   
   recs <- vector("list", total_candidates)
   idx  <- 0L
   
-  # Enumerate splits
-  for (split_name in names(season_splits)){
-    seasons <- season_splits[[split_name]]
+  # -------- S1 (ALL): GDD variants + Bins --------
+  # GDD: bases {5,10}, caps {26..32}
+  for (b in gdd_base_grid){
+    for (H in hdd_cap_grid){
+      ta  <- list(ALL = paste0("gdd", b, "_", H))
+      fts <- build_candidate_features("S1", ta)
+      df  <- merge(Y, fts, by = c("fips","year"), all.x = TRUE)
+      df[is.na(df)] <- 0
+      
+      rhs <- build_rhs_terms(names(df), "S1", ta)
+      sc  <- loyo_skill_df(crop_slug, df, rhs)
+      
+      idx <- idx + 1L
+      recs[[idx]] <- data.table(
+        split = "S1",
+        temp_model = "gdd",
+        gdd_base_ALL = b,
+        hdd_cap_ALL  = H,
+        rhs = rhs,
+        median_skill = sc$median_skill,
+        mean_trim2   = sc$mean_trim2,
+        mean_skill   = sc$mean_skill,
+        n_folds      = length(sc$skills)
+      )
+      if (verbose && (idx %% 50 == 0)) cat(sprintf("  ... %d / %d\n", idx, total_candidates))
+    }
+  }
+  # Bins (ALL)
+  {
+    ta  <- list(ALL = "bin5C_10")
+    fts <- build_candidate_features("S1", ta)
+    df  <- merge(Y, fts, by = c("fips","year"), all.x = TRUE)
+    df[is.na(df)] <- 0
     
-    # --- Temperature assignment enumerations ---
-    # 1) All NONE
-    temp_assign_list <- list(setNames(as.list(rep("none", length(seasons))), seasons))
+    rhs <- build_rhs_terms(names(df), "S1", ta)
+    sc  <- loyo_skill_df(crop_slug, df, rhs)
     
-    # 2) For each non-NONE type, apply to each non-empty subset of seasons
-    non_none_types <- setdiff(temp_types, "none")
-    subsets <- all_subsets(seasons, include_empty = FALSE)
-    for (tt in non_none_types){
-      for (S in subsets){
-        ta <- setNames(as.list(rep("none", length(seasons))), seasons)
-        if (length(S)) for (sn in S) ta[[sn]] <- tt
-        temp_assign_list[[length(temp_assign_list) + 1L]] <- ta
+    idx <- idx + 1L
+    recs[[idx]] <- data.table(
+      split = "S1",
+      temp_model = "bins",
+      rhs = rhs,
+      median_skill = sc$median_skill,
+      mean_trim2   = sc$mean_trim2,
+      mean_skill   = sc$mean_skill,
+      n_folds      = length(sc$skills)
+    )
+    if (verbose && (idx %% 50 == 0)) cat(sprintf("  ... %d / %d\n", idx, total_candidates))
+  }
+  
+  # -------- S2A (SPRING,SUMMER): GDD×GDD + Bins×Bins --------
+  # GDD x GDD with independent thresholds
+  for (bS in gdd_base_grid){
+    for (HS in hdd_cap_grid){
+      for (bU in gdd_base_grid){
+        for (HU in hdd_cap_grid){
+          ta <- list(SPRING = paste0("gdd", bS, "_", HS),
+                     SUMMER = paste0("gdd", bU, "_", HU))
+          fts <- build_candidate_features("S2A", ta)
+          df  <- merge(Y, fts, by = c("fips","year"), all.x = TRUE)
+          df[is.na(df)] <- 0
+          
+          rhs <- build_rhs_terms(names(df), "S2A", ta)
+          sc  <- loyo_skill_df(crop_slug, df, rhs)
+          
+          idx <- idx + 1L
+          recs[[idx]] <- data.table(
+            split = "S2A",
+            temp_model = "gdd",
+            gdd_base_SPRING = bS,
+            hdd_cap_SPRING  = HS,
+            gdd_base_SUMMER = bU,
+            hdd_cap_SUMMER  = HU,
+            rhs = rhs,
+            median_skill = sc$median_skill,
+            mean_trim2   = sc$mean_trim2,
+            mean_skill   = sc$mean_skill,
+            n_folds      = length(sc$skills)
+          )
+          if (verbose && (idx %% 50 == 0)) cat(sprintf("  ... %d / %d\n", idx, total_candidates))
+        }
       }
     }
+  }
+  # Bins × Bins
+  {
+    ta  <- list(SPRING = "bin5C_10", SUMMER = "bin5C_10")
+    fts <- build_candidate_features("S2A", ta)
+    df  <- merge(Y, fts, by = c("fips","year"), all.x = TRUE)
+    df[is.na(df)] <- 0
     
-    # --- PPT assignment enumerations (independent per season) ---
-    ppt_assign_list <- list()
-    ppt_subsets <- all_subsets(seasons, include_empty = TRUE) # subset that receives 'quad'
-    for (P in ppt_subsets){
-      pa <- setNames(as.list(rep("none", length(seasons))), seasons)
-      if (length(P)) for (sn in P) pa[[sn]] <- "quad"
-      ppt_assign_list[[length(ppt_assign_list) + 1L]] <- pa
-    }
+    rhs <- build_rhs_terms(names(df), "S2A", ta)
+    sc  <- loyo_skill_df(crop_slug, df, rhs)
     
-    # --- Cross product of temp and ppt assignments ---
-    for (ta in temp_assign_list){
-      # Build features once for this temp assignment; PPT will add linear/quad terms only
-      # but features for PPT are also pulled from caches, so we must rebuild per PPT pattern.
-      for (pa in ppt_assign_list){
-        
-        # features from caches
-        feats <- build_candidate_features(split = split_name,
-                                          temp_assign = ta,
-                                          ppt_assign  = pa)
-        
-        # Merge with outcome (all yields kept; features fill missing with 0 in builder)
-        if (!nrow(feats)) next
-        df <- merge(Y, feats, by = c("fips","year"), all.x = TRUE)
-        df[is.na(df)] <- 0
-        
-        # Build RHS
-        rhs <- build_rhs_terms(names(df), split_name, ta, pa)
-        
-        # Score via LOYO vs baseline
-        sc  <- loyo_skill_df(crop_slug, df, rhs)
-        
-        idx <- idx + 1L
-        row <- list(
-          split        = split_name,
-          rhs          = rhs,
-          median_skill = sc$median_skill,
-          mean_skill   = sc$mean_skill,
-          n_folds      = length(sc$skills)
-        )
-        # add temp_* and ppt_* columns explicitly
-        for (nm in names(ta)) row[[paste0("temp_", nm)]] <- ta[[nm]]
-        for (nm in names(pa)) row[[paste0("ppt_",  nm)]] <- pa[[nm]]
-        
-        recs[[idx]] <- as.data.table(row)
-        
-        if (verbose && (idx %% 50 == 0)) cat(sprintf("  ... %d / %d\n", idx, total_candidates))
-      }
-    }
+    idx <- idx + 1L
+    recs[[idx]] <- data.table(
+      split = "S2A",
+      temp_model = "bins",
+      rhs = rhs,
+      median_skill = sc$median_skill,
+      mean_trim2   = sc$mean_trim2,
+      mean_skill   = sc$mean_skill,
+      n_folds      = length(sc$skills)
+    )
+    if (verbose && (idx %% 50 == 0)) cat(sprintf("  ... %d / %d\n", idx, total_candidates))
   }
   
   # Compact results
   cv_table <- rbindlist(recs[seq_len(idx)], use.names = TRUE, fill = TRUE)
-  setorder(cv_table, -median_skill, -mean_skill)
+  setorder(cv_table, -median_skill, -mean_trim2, -mean_skill)
   
   # Save
   out_csv <- file.path(save_dir, sprintf("%s_cv_comparison_table.csv", tolower(crop_slug)))
@@ -463,7 +468,9 @@ run_cv_multiseason <- function(yld_raw, crop_slug, save_dir, years_use,
   invisible(cv_table)
 }
 
-# ---------- Outcome loader (same as your earlier helper) ----------
+# -----------------------------
+# Outcome loader (same as before)
+# -----------------------------
 load_outcome <- function(csv_path, years_use){
   dat <- fread(csv_path)
   setnames(dat,
@@ -483,46 +490,22 @@ load_outcome <- function(csv_path, years_use){
 }
 
 # ============================================================
-# Example: RUN across the three crops
-# (make sure caches were precomputed once before this)
+# PRECOMPUTE (ONCE), THEN RUN FOR CROPS
 # ============================================================
+precompute_dd(tempbinsdata)    # base in {5,10}, cap in {26..32}
+precompute_bin5(tempbinsdata)  # SPRING, SUMMER, ALL
+precompute_ppt(weatherdata)    # SPRING, SUMMER, ALL (always quadratic later)
 
-root <- "/Users/gammansm/Dropbox/NorthernLatitudeCrops_CCimpacts/Data"
-bins_csv  <- file.path(root, "USco_PRISM_bins_monthly_1981_2022_cropland.csv")
-weath_csv <- file.path(root, "USco_PRISM_weather_monthly_1981_2022_cropland.csv")
+cat("\nSanity check: total candidate models per crop = ", count_candidates(), "\n", sep = "")  # 212
 
-# Load raw weather once
-tempbinsdata <- fread(bins_csv)
-weatherdata  <- fread(weath_csv)
-stopifnot(all(c("fips","year","month") %in% names(tempbinsdata)))
-stopifnot(all(c("fips","year","month") %in% names(weatherdata)))
-
-# Normalize types
-tempbinsdata[, `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
-weatherdata[,  `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
-
-# Ensure ppt column is named 'ppt'
-ppt_col <- intersect(c("ppt","ppt_mm","prcp_mm","precip_mm","prcp"), names(weatherdata))
-if (!length(ppt_col)) stop("Monthly weather must include a precip column.")
-setnames(weatherdata, ppt_col[1], "ppt")
-
-# Precompute caches ONCE
-precompute_dd(tempbinsdata)
-precompute_bin5(tempbinsdata)
-precompute_ppt(weatherdata)
-
-# Years / states
-years_use <- c(1981:2019, 2021:2022)
-filt_states_north <- c(8,16,26,27,30,31,38,39,41,53,56)  # CO, ID, MI, MN, MT, NE, ND, OH, OR, WA, WY (etc.)
-
-# Run
 for (crop in c("sunflower","canola","flaxseed")) {
   yfile <- file.path(root, sprintf("%s_yields.csv", crop))
-  if (!file.exists(yfile)) { cat(sprintf("\n-- %s yields not found: %s (skipping) --\n", toupper(crop), yfile)); next }
+  if (!file.exists(yfile)) {
+    cat(sprintf("\n-- %s yields not found: %s (skipping) --\n", toupper(crop), yfile))
+    next
+  }
   yld_raw <- load_outcome(yfile, years_use)
-  run_cv_multiseason(yld_raw, crop_slug = crop, save_dir = root, years_use = years_use,
-                     keep_states = filt_states_north, verbose = TRUE)
+  run_cv_multiseason(yld_raw, crop_slug = crop, save_dir = root,
+                     years_use = years_use, keep_states = filt_states_north,
+                     verbose = TRUE)
 }
-
-
-

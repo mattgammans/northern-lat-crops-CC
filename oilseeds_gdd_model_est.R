@@ -1,10 +1,9 @@
 # ============================================================
-# CV + FE model with GDD-triggered stage splits (monthly data)
-# Crops: sunflower, canola, flaxseed
-# - CV chooses: 2 vs 3 stages; split1 (and split2); HDD/PPT sharing
-# - Constraints: GDD slope shared; HDD threshold = 30C; PPT quadratic
-# - Model: county FE + linear time trend; LOYO by year
-# - Northern states filter; robust State.ANSI derivation
+# Single-season CV (Apr–Oct) — select by MEDIAN SKILL
+# No centering, NO winsorization of precipitation
+# Baseline: yield ~ t + i(State.ANSI, t) | fips
+# Candidate RHS:
+#   GDD+HDD+PPT (linear), GDD+HDD+PPT+PPT^2
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -13,52 +12,30 @@ suppressPackageStartupMessages({
 })
 
 # -----------------------------
-# PATHS
+# PATHS / SETTINGS
 # -----------------------------
 root <- "/Users/gammansm/Dropbox/NorthernLatitudeCrops_CCimpacts/Data"
 bins_csv  <- file.path(root, "USco_PRISM_bins_monthly_1981_2022_cropland.csv")
 weath_csv <- file.path(root, "USco_PRISM_weather_monthly_1981_2022_cropland.csv")
 
-# -----------------------------
-# Northern states only (ANSI)
-# -----------------------------
-filt_states_north <- c(8,16,26,27,30,31,38,39,41,53,56) # add 46 (SD), 55 (WI) if desired
+years_use <- c(1981:2019,2021:2022)
+months_in_season <- 4:10
+gdd_base_grid    <- c(5, 10)
+heat_thr_grid    <- c(28, 30, 32)
+filt_states_north <- c(8,16,26,27,30,31,38,39,41,53,56)
 
-# -----------------------------
-# CV SETTINGS
-# -----------------------------
-years_use     <- 1981:2022
-gdd_base_grid <- 10   # search bases (°C) used to compute GDD_mon
-hdd_thresh    <- 30           # fixed HDD threshold (°C)
-# Stage GDD cutpoints (°C·day) to search:
-split1_grid   <- seq(600, 650, by = 50)   # begin flowering
-split2_grid   <- seq(850, 900, by = 50)   # end flowering (3-stage only), requires > split1 + 100
-hdd_patterns  <- c("shared_all", "separate_all")
-ppt_patterns  <- c("shared_all", "separate_all")
-
-# -----------------------------
-# LOAD WEATHER
-# -----------------------------
-tempbinsdata <- fread(bins_csv)
-weatherdata  <- fread(weath_csv)
-
-stopifnot(all(c("fips","year","month") %in% names(tempbinsdata)))
-stopifnot(all(c("fips","year","month") %in% names(weatherdata)))
-
-tempbinsdata[, `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
-weatherdata[,  `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
-
-# precip column -> ppt
-ppt_col <- intersect(c("ppt","ppt_mm","prcp_mm","precip_mm","prcp"), names(weatherdata))
-if (!length(ppt_col)) stop("Monthly weather must include a precip column.")
-setnames(weatherdata, ppt_col[1], "ppt")
+# Candidate RHS (no centering; NO winsorization; PPT as-is)
+rhs_menu <- list(
+  GDD_HDD_P2 = "GDD_season + HDD_season + PPT_season + I(PPT_season^2)",
+  GDD_HDD_P  = "GDD_season + HDD_season + PPT_season"
+)
 
 # -----------------------------
 # UTILITIES
 # -----------------------------
 ensure_state_ansi <- function(DT){
+  DT <- as.data.table(DT)
   if (!("State.ANSI" %in% names(DT)) || any(!is.finite(suppressWarnings(as.numeric(DT$State.ANSI))))) {
-    if (!("fips" %in% names(DT))) stop("ensure_state_ansi(): 'fips' not found.")
     DT[, State.ANSI := as.integer(fips %/% 1000L)]
   } else {
     DT[, State.ANSI := as.integer(State.ANSI)]
@@ -69,155 +46,138 @@ ensure_state_ansi <- function(DT){
 disc_bins <- function(TB){
   nm <- names(TB)
   bins <- nm[grepl("^bin_-?\\d+$", nm)]
-  if (!length(bins)) stop("No bin_* columns in bins file.")
+  if (!length(bins)) stop("No bin_* columns found.")
   k <- as.integer(sub("^bin_", "", bins))
+  keep <- is.finite(k)
+  bins <- bins[keep]; k <- k[keep]
   ord <- order(k)
   list(bins = bins[ord], k = k[ord])
 }
 
-# monthly GDD & HDD30 from discrete temp bins
 make_monthly_dd <- function(tempbinsdata, gdd_base, heat_thr){
-  db  <- disc_bins(tempbinsdata)
-  MM  <- as.data.frame(tempbinsdata[, c("fips","year","month", db$bins), with = FALSE])
-  Hdy <- as.matrix(MM[, db$bins, drop = FALSE]) / 24  # hours -> days
+  db <- disc_bins(tempbinsdata)
+  MM <- as.data.table(tempbinsdata[, c("fips","year","month", db$bins), with = FALSE])
+  for (b in db$bins) { MM[, (b) := suppressWarnings(as.numeric(get(b)))]; MM[is.na(get(b)), (b) := 0] }
+  Hdy <- as.matrix(MM[, db$bins, with = FALSE]) / 24
+  storage.mode(Hdy) <- "double"
+  gdd_base <- as.numeric(gdd_base)[1]; heat_thr <- as.numeric(heat_thr)[1]
   w_gdd <- pmax(pmin(db$k, heat_thr) - gdd_base, 0)
   w_hdd <- pmax(db$k - heat_thr, 0)
-  out <- MM[, c("fips","year","month"), drop = FALSE]
-  out$GDD_mon   <- as.numeric(Hdy %*% w_gdd)
-  out$HDD30_mon <- as.numeric(Hdy %*% w_hdd)
-  out
+  if (ncol(Hdy) != length(w_gdd)) stop("Non-conformable bins/weights.")
+  out <- MM[, .(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
+  out[, GDD_mon := as.numeric(Hdy %*% w_gdd)]
+  out[, HDD_mon := as.numeric(Hdy %*% w_hdd)]
+  out[]
 }
 
-# fractional share of a month before trigger T* given cum_prev and the month’s GDD
-frac_before_in_month <- function(cum_prev, gdd_m, Tstar){
-  if (is.na(gdd_m) || gdd_m <= 0) return(1)
-  need <- Tstar - cum_prev
-  if (need <= 0) return(0)      # already crossed
-  if (need >= gdd_m) return(1)  # won't cross this month
-  max(0, min(1, need / gdd_m))
-}
-
-# Build 2- or 3-stage features via GDD triggers with fractional month apportionment
-# Outputs county-year: GDD_total; HDD_s1..s3; P_s1..s3; State.ANSI
-build_stage_features <- function(tempbinsdata, weatherdata, gdd_base, split1, split2 = NA_real_, n_stages = 2){
-  stopifnot(n_stages %in% c(2,3))
-  DD <- make_monthly_dd(tempbinsdata, gdd_base = gdd_base, heat_thr = hdd_thresh)
-  W  <- weatherdata[, .(fips, year, month, ppt)]
-  W[, ppt := as.numeric(ppt) / 100]
+build_season_features <- function(tempbinsdata, weatherdata, gdd_base, heat_thr){
+  DD <- make_monthly_dd(tempbinsdata, gdd_base = gdd_base, heat_thr = heat_thr)
+  W  <- as.data.table(weatherdata[, .(fips, year, month, ppt)])
+  W[is.na(ppt), ppt := 0]
+  W[, ppt := as.numeric(ppt) / 100]  # keep your scaling
   M  <- merge(DD, W, by = c("fips","year","month"), all.x = TRUE)
-  setDT(M); setorder(M, fips, year, month)
-  M[is.na(ppt), ppt := 0]
-  M[, GDD_cum := cumsum(GDD_mon), by = .(fips, year)]
-  M[, `:=`(w_s1=0, w_s2=0, w_s3=0)]
-  
-  byfun <- function(df){
-    df <- df[order(month)]
-    cum_prev <- shift(df$GDD_cum, fill = 0)
-    gdd_m    <- df$GDD_mon
-    if (n_stages == 2){
-      p1 <- mapply(frac_before_in_month, cum_prev, gdd_m, MoreArgs = list(Tstar = split1))
-      df$w_s1 <- p1
-      df$w_s2 <- 1 - p1
-      df$w_s3 <- 0
-    } else {
-      p1 <- mapply(frac_before_in_month, cum_prev, gdd_m, MoreArgs = list(Tstar = split1))
-      g_before1 <- p1 * gdd_m
-      g_after1  <- (1 - p1) * gdd_m
-      cum_prev2 <- cum_prev + g_before1
-      p2 <- mapply(frac_before_in_month, cum_prev2, g_after1, MoreArgs = list(Tstar = split2))
-      df$w_s1 <- p1
-      df$w_s2 <- (1 - p1) * p2
-      df$w_s3 <- (1 - p1) * (1 - p2)
-    }
-    df
-  }
-  M <- M[, byfun(.SD), by = .(fips, year)]
-  
-  # stage-weight monthly HDD and precip; GDD_total is shared
-  for(s in c("s1","s2","s3")){
-    ws <- paste0("w_", s)
-    if (s != "s3" || n_stages == 3){
-      M[, paste0("HDD_", s) := get(ws) * HDD30_mon]
-      M[, paste0("P_",   s) := get(ws) * ppt]
-    } else {
-      M[, paste0("HDD_", s) := 0]
-      M[, paste0("P_",   s) := 0]
-    }
-  }
-  
-  feat <- M[, .(
-    GDD_total = sum(GDD_mon, na.rm = TRUE),
-    HDD_s1 = sum(HDD_s1, na.rm = TRUE),
-    HDD_s2 = sum(HDD_s2, na.rm = TRUE),
-    HDD_s3 = sum(HDD_s3, na.rm = TRUE),
-    P_s1   = sum(P_s1,   na.rm = TRUE),
-    P_s2   = sum(P_s2,   na.rm = TRUE),
-    P_s3   = sum(P_s3,   na.rm = TRUE)
+  M  <- M[month %in% months_in_season]
+  M[, .(
+    GDD_season = sum(GDD_mon, na.rm = TRUE),
+    HDD_season = sum(HDD_mon, na.rm = TRUE),
+    PPT_season = sum(ppt,     na.rm = TRUE)
   ), by = .(fips, year)]
-  
-  feat <- ensure_state_ansi(feat)
-  feat[]
 }
 
-# Build model formula given stage count and sharing patterns
-make_fml_builder <- function(n_stages, hdd_pattern, ppt_pattern){
-  function(avail_names){
-    rhs <- c("GDD_total", "t")  # shared GDD + linear trend
-    # HDD terms
-    if (hdd_pattern == "shared_all"){
-      need <- c("HDD_s1","HDD_s2", if (n_stages==3) "HDD_s3")
-      need <- need[need %in% avail_names]
-      rhs  <- c(rhs, sprintf("I(%s)", paste(need, collapse = " + ")))
-    } else {
-      add <- c("HDD_s1","HDD_s2", if (n_stages==3) "HDD_s3")
-      add <- add[add %in% avail_names]
-      rhs <- c(rhs, add)
+# -----------------------------
+# LOYO SKILL for a given RHS (string) on a given df
+# - Baseline: t + i(State.ANSI, t) | fips
+# - NO winsorization, NO centering
+# -----------------------------
+loyo_skill_for_rhs <- function(df, rhs_string){
+  DT <- as.data.table(df)
+  if (!"State.ANSI" %in% names(DT)) DT[, State.ANSI := as.integer(fips %/% 1000L)]
+  yrs <- sort(unique(DT$year))
+  skills <- c()
+  
+  for (yv in yrs){
+    tr <- copy(DT[year != yv]); te <- copy(DT[year == yv])
+    if (nrow(tr) < 30 || nrow(te) < 10) next
+    
+    # center time on TRAIN
+    t0 <- mean(tr$year, na.rm = TRUE)
+    tr[, t := year - t0]; te[, t := year - t0]
+    
+    # Baseline
+    base <- tryCatch(feols(yield ~ t + i(State.ANSI, t) | fips, data = tr, cluster = ~ State.ANSI), error = function(e) NULL)
+    if (is.null(base)) next
+    pb <- predict(base, newdata = te, fixef = FALSE)
+    
+    # Candidate
+    fml <- as.formula(paste0("yield ~ t + i(State.ANSI, t) + ", rhs_string, " | fips"))
+    mod <- tryCatch(feols(fml, data = tr, cluster = ~ State.ANSI), error = function(e) NULL)
+    if (is.null(mod)) next
+    pm <- predict(mod, newdata = te, fixef = FALSE)
+    
+    ok <- is.finite(te$yield) & is.finite(pb) & is.finite(pm)
+    if (!any(ok)) next
+    mse_b <- mean((te$yield[ok] - pb[ok])^2)
+    mse_m <- mean((te$yield[ok] - pm[ok])^2)
+    if (is.finite(mse_b) && mse_b > 0 && is.finite(mse_m)){
+      skills <- c(skills, 1 - mse_m/mse_b)
     }
-    # Precip quadratic
-    if (ppt_pattern == "shared_all"){
-      need <- c("P_s1","P_s2", if (n_stages==3) "P_s3")
-      need <- need[need %in% avail_names]
-      rhs  <- c(rhs, sprintf("I(%s)", paste(need, collapse = " + ")))
-      rhs  <- c(rhs, sprintf("I((%s)^2)", paste(need, collapse = " + ")))
-    } else {
-      for(s in c("s1","s2", if(n_stages==3) "s3")){
-        p <- paste0("P_", s)
-        if (p %in% avail_names){
-          rhs <- c(rhs, p, sprintf("I(%s^2)", p))
+  }
+  list(skills = skills,
+       mean_skill = if (length(skills)) mean(skills) else -Inf,
+       median_skill = if (length(skills)) median(skills) else -Inf)
+}
+
+# -----------------------------
+# CV SEARCH (grid × RHS), select by MEDIAN SKILL (tie-break by MEAN SKILL)
+# -----------------------------
+cv_search_single <- function(yld_raw){
+  recs <- list(); best <- NULL; idx <- 0L
+  for (b in gdd_base_grid){
+    for (H in heat_thr_grid){
+      feats <- build_season_features(tempbinsdata, weatherdata, gdd_base = b, heat_thr = H)
+      df <- merge(yld_raw[, .(fips, year, yield, State.ANSI)], feats, by = c("fips","year"), all = FALSE)
+      df <- ensure_state_ansi(df)[State.ANSI %in% filt_states_north]
+      if (nrow(df) < 120) next
+      
+      for (nm in names(rhs_menu)){
+        rhs <- rhs_menu[[nm]]
+        sc  <- loyo_skill_for_rhs(df, rhs)
+        idx <- idx + 1L
+        recs[[idx]] <- data.table(
+          gdd_base = b, heat_thr = H, rhs = nm,
+          median_skill = sc$median_skill, mean_skill = sc$mean_skill,
+          n_folds = length(sc$skills)
+        )
+        if (is.null(best) ||
+            sc$median_skill > best$median_skill + 1e-12 ||
+            (abs(sc$median_skill - best$median_skill) <= 1e-12 && sc$mean_skill > best$mean_skill)){
+          best <- list(
+            gdd_base = b, heat_thr = H, rhs = nm,
+            median_skill = sc$median_skill, mean_skill = sc$mean_skill,
+            df = df
+          )
         }
       }
     }
-    as.formula(paste("yield ~", paste(rhs, collapse = " + "), "| fips"))
   }
+  cv_table <- if (length(recs)) rbindlist(recs)[order(-median_skill, -mean_skill)] else data.table()
+  list(cv_table = cv_table, best = best)
 }
 
-# LOYO CV (year-only), county FE; cluster by State.ANSI
-loyo_cv_fe <- function(df, fml_builder, min_test = 10, min_train = 30){
-  df <- as.data.table(df)
-  df <- ensure_state_ansi(df)
-  yrs <- sort(unique(df$year))
-  r2s <- numeric(0)
-  for (yv in yrs){
-    tr <- df[year != yv]
-    te <- df[year == yv]
-    if (nrow(tr) < min_train || nrow(te) < min_test) next
-    t0 <- mean(tr$year, na.rm = TRUE)
-    tr[, t := year - t0]
-    te[, t := year - t0]
-    fml <- fml_builder(names(tr))
-    fit <- tryCatch(feols(fml, data = tr, cluster = ~ State.ANSI), error = function(e) NULL)
-    if (is.null(fit)) next
-    yhat <- tryCatch(predict(fit, newdata = te, fixef = FALSE), error = function(e) rep(NA_real_, nrow(te)))
-    ok <- is.finite(yhat) & is.finite(te$yield)
-    if (!any(ok)) next
-    mse <- mean((te$yield[ok] - yhat[ok])^2)
-    vte <- var(te$yield[ok])
-    if (is.finite(mse) && is.finite(vte) && vte > 0) r2s <- c(r2s, 1 - mse/vte)
-  }
-  if (length(r2s) == 0) -Inf else mean(r2s)
+# -----------------------------
+# Final refit on selected combo (NO winsorization)
+# -----------------------------
+refit_best_single <- function(df_best, rhs_name){
+  D <- copy(as.data.table(df_best))
+  if (!"t" %in% names(D)) { t0 <- mean(D$year, na.rm = TRUE); D[, t := year - t0] }
+  rhs <- rhs_menu[[rhs_name]]
+  fml <- as.formula(paste0("yield ~ ", rhs, " + i(State.ANSI, t) | fips"))
+  feols(fml, data = D, cluster = ~ State.ANSI)
 }
 
-# Load outcome (annual log yield)
+# -----------------------------
+# Load outcome
+# -----------------------------
 load_outcome <- function(csv_path, years_use){
   dat <- fread(csv_path)
   setnames(dat,
@@ -226,7 +186,6 @@ load_outcome <- function(csv_path, years_use){
            skip_absent = TRUE)
   dat[, Value := as.numeric(gsub("[^0-9.\\-]", "", as.character(Value)))]
   dat <- dat[is.finite(Value) & Value > 0]
-  # build/clean IDs
   if (!("fips" %in% names(dat))) {
     dat[, State.ANSI  := as.integer(State.ANSI)]
     dat[, County.ANSI := as.integer(County.ANSI)]
@@ -234,112 +193,154 @@ load_outcome <- function(csv_path, years_use){
   } else dat[, fips := as.integer(fips)]
   dat[, `:=`(year = as.integer(year), yield = log(Value))]
   dat <- dat[is.finite(fips) & year %in% years_use]
-  dat <- ensure_state_ansi(dat)
-  as.data.frame(dat)
+  ensure_state_ansi(dat)[]
 }
 
 # -----------------------------
-# CV SEARCH WRAPPER
+# LOAD WEATHER & RUN
 # -----------------------------
-cv_search <- function(yld_raw, tempbinsdata, weatherdata){
-  recs <- list(); best <- list(score = -Inf); idx <- 0L
+tempbinsdata <- fread(bins_csv)
+weatherdata  <- fread(weath_csv)
+
+stopifnot(all(c("fips","year","month") %in% names(tempbinsdata)))
+stopifnot(all(c("fips","year","month") %in% names(weatherdata)))
+
+tempbinsdata[, `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
+weatherdata[,  `:=`(fips = as.integer(fips), year = as.integer(year), month = as.integer(month))]
+ppt_col <- intersect(c("ppt","ppt_mm","prcp_mm","precip_mm","prcp"), names(weatherdata))
+if (!length(ppt_col)) stop("Monthly weather must include a precip column.")
+setnames(weatherdata, ppt_col[1], "ppt")
+
+run_pipeline_single <- function(yld_raw, crop_slug, save_dir = root, run_fit = TRUE){
+  label <- tools::toTitleCase(crop_slug)
+  cat(sprintf("\n\n########## %s (Single Season Apr–Oct) ##########\n", toupper(label)))
+  res <- cv_search_single(yld_raw)
   
-  # candidate split sets
-  cand_specs <- list()
-  for (s1 in split1_grid) cand_specs <- append(cand_specs, list(list(n_stages=2, split1=s1, split2=NA)))
-  for (s1 in split1_grid) for (s2 in split2_grid) if (s2 > s1 + 100)
-    cand_specs <- append(cand_specs, list(list(n_stages=3, split1=s1, split2=s2)))
+  cat("\n================ ", toupper(label), " — CV (grid × RHS; north only) ================\n", sep = "")
+  if (nrow(res$cv_table)) print(res$cv_table, row.names = FALSE) else cat("No valid CV results.\n")
+  if (is.null(res$best)) { cat("\nNo valid spec.\n"); return(invisible(NULL)) }
   
-  for (base in gdd_base_grid){
-    for (cs in cand_specs){
-      feats <- build_stage_features(tempbinsdata, weatherdata,
-                                    gdd_base = base, split1 = cs$split1,
-                                    split2 = cs$split2, n_stages = cs$n_stages)
-      df <- merge(yld_raw[, c("fips","year","yield","State.ANSI")],
-                  feats[,   c("fips","year","GDD_total","HDD_s1","HDD_s2","HDD_s3","P_s1","P_s2","P_s3","State.ANSI")],
-                  by = c("fips","year"), all = FALSE, suffixes = c(".y",".x"))
-      df <- as.data.table(df)
-      # collapse any .x/.y State.ANSI
-      if ("State.ANSI.x" %in% names(df) || "State.ANSI.y" %in% names(df)){
-        if (!"State.ANSI" %in% names(df))
-          df[, State.ANSI := fifelse(is.finite(as.numeric(`State.ANSI.x`)), as.integer(`State.ANSI.x`), as.integer(`State.ANSI.y`))]
-        df[, c("State.ANSI.x","State.ANSI.y") := NULL]
-      }
-      df <- ensure_state_ansi(df)
-      # filter north
-      df <- df[State.ANSI %in% filt_states_north]
-      if (nrow(df) < 120) next
-      
-      for (hpat in hdd_patterns){
-        for (ppat in ppt_patterns){
-          fml_builder <- make_fml_builder(cs$n_stages, hpat, ppat)
-          sc <- loyo_cv_fe(df, fml_builder)
-          idx <- idx + 1L
-          recs[[idx]] <- data.frame(
-            gdd_base = base, n_stages = cs$n_stages,
-            split1 = cs$split1, split2 = ifelse(is.na(cs$split2), NA, cs$split2),
-            hdd = hpat, ppt = ppat, score = sc
-          )
-          if (is.finite(sc) && sc > best$score){
-            best <- list(score = sc, df = df, gdd_base = base,
-                         n_stages = cs$n_stages, split1 = cs$split1, split2 = cs$split2,
-                         hdd = hpat, ppt = ppat)
-          }
-        }
+  out_csv <- file.path(save_dir, sprintf("%s_single_season_df.csv", tolower(crop_slug)))
+  fwrite(res$best$df, out_csv)
+  cat(sprintf("\nSaved single-season features → %s\n", out_csv))
+  
+  cat("\n=== Best combo ===\n")
+  cat(sprintf("GDD base: %g | Heat thr: %g | RHS: %s | median SKILL: %.3f | mean SKILL: %.3f\n",
+              res$best$gdd_base, res$best$heat_thr, res$best$rhs,
+              res$best$median_skill, res$best$mean_skill))
+  
+  if (isTRUE(run_fit)){
+    mod <- refit_best_single(res$best$df, res$best$rhs)
+    cat("\n=== Final model (single season; selected RHS) ===\n")
+    print(summary(mod))
+    invisible(list(cv_table = res$cv_table, best = res$best, model = mod, df_path = out_csv))
+  } else {
+    invisible(list(cv_table = res$cv_table, best = res$best, df_path = out_csv))
+  }
+}
+
+for (crop in c("sunflower","canola","flaxseed")) {
+  yfile <- file.path(root, sprintf("%s_yields.csv", crop))
+  if (!file.exists(yfile)) { cat(sprintf("\n-- %s yields not found: %s (skipping) --\n", toupper(crop), yfile)); next }
+  yld_raw <- load_outcome(yfile, years_use)
+  run_pipeline_single(yld_raw, crop_slug = crop, save_dir = root, run_fit = TRUE)
+}
+
+
+
+
+
+
+
+### estimate models with best mean error
+
+# ============================================================
+# Refit models chosen by MEAN skill (instead of median skill)
+# ============================================================
+
+library(data.table)
+library(fixest)
+
+root <- "/Users/gammansm/Dropbox/NorthernLatitudeCrops_CCimpacts/Data"
+
+# -----------------------------
+# Function to build formula safely (handles single or staged)
+# -----------------------------
+make_selected_formula <- function(n_stages, hdd, ppt, avail) {
+  n_stages <- ifelse(is.na(n_stages) || n_stages < 2, 1, n_stages)
+  rhs <- c("GDD_total", "t")
+  
+  # HDD block
+  if (hdd == "shared_all") {
+    need <- intersect(c("HDD_s1","HDD_s2", if (n_stages == 3) "HDD_s3"), avail)
+    if (length(need)) rhs <- c(rhs, sprintf("I(%s)", paste(need, collapse = " + ")))
+  } else {
+    if (n_stages == 1) {
+      need <- intersect("HDD_total", avail)
+    } else {
+      need <- intersect(c("HDD_s1","HDD_s2", if (n_stages == 3) "HDD_s3"), avail)
+    }
+    rhs <- c(rhs, need)
+  }
+  
+  # Precipitation block (linear + quadratic)
+  if (ppt == "shared_all") {
+    need <- intersect(c("P_s1","P_s2", if (n_stages == 3) "P_s3"), avail)
+    if (length(need)) {
+      rhs <- c(rhs, sprintf("I(%s)", paste(need, collapse = " + ")))
+      rhs <- c(rhs, sprintf("I((%s)^2)", paste(need, collapse = " + ")))
+    }
+  } else {
+    if (n_stages == 1) {
+      need <- intersect("P_total", avail)
+      rhs <- c(rhs, need, sprintf("I(%s^2)", need))
+    } else {
+      for (s in c("s1","s2", if (n_stages == 3) "s3")) {
+        p <- paste0("P_", s)
+        if (p %in% avail) rhs <- c(rhs, p, sprintf("I(%s^2)", p))
       }
     }
   }
   
-  cv_table <- if (length(recs)) { out <- rbindlist(recs); out[order(-score)] } else data.frame()
-  list(cv_table = cv_table, best = best)
+  as.formula(paste("yield ~ i(State.ANSI, year) +", paste(rhs, collapse = " + "), "| fips"))
 }
 
 # -----------------------------
-# Final refit on best spec
+# Function to refit model for given crop
 # -----------------------------
-refit_best <- function(best){
-  fml_builder <- make_fml_builder(best$n_stages, best$hdd, best$ppt)
-  t0 <- mean(best$df$year, na.rm = TRUE)
-  best$df[, t := year - t0]
-  fml <- fml_builder(names(best$df))
-  feols(fml, data = best$df, cluster = ~ State.ANSI)
-}
-
-# -----------------------------
-# Runner for a crop
-# -----------------------------
-run_pipeline <- function(yld_raw, label = "Outcome"){
-  cat(sprintf("\n\n########## %s ##########\n", toupper(label)))
-  res <- cv_search(yld_raw, tempbinsdata, weatherdata)
-  cat("\n================ ", toupper(label), " — CV (stages × splits × sharing; northern states only) ================\n", sep = "")
-  if (nrow(res$cv_table)) print(res$cv_table, row.names = FALSE) else cat("No valid CV results.\n")
+refit_best_mean <- function(crop_slug) {
+  cv_path <- file.path(root, sprintf("%s_cv_comparison_table.csv", tolower(crop_slug)))
+  df_path <- file.path(root, sprintf("%s_best_stages_df.csv", tolower(crop_slug)))
   
-  if (is.finite(res$best$score)){
-    mod <- refit_best(res$best)
-    b <- res$best
-    cat("\n=== Best spec ===\n")
-    cat(sprintf("GDD base: %g | Stages: %d | split1: %g | split2: %s | HDD: %s | PPT: %s\n",
-                b$gdd_base, b$n_stages, b$split1,
-                ifelse(is.na(b$split2), "NA", as.character(b$split2)),
-                b$hdd, b$ppt))
-    cat(sprintf("LOYO CV R^2: %.3f\n\n", b$score))
-    print(summary(mod))
-    invisible(list(cv_table = res$cv_table, best = b, model = mod))
-  } else {
-    cat("\nNo valid spec.\n")
-    invisible(NULL)
+  if (!file.exists(cv_path)) stop("CV results not found for ", crop_slug)
+  if (!file.exists(df_path)) stop("Best-stages dataframe not found for ", crop_slug)
+  
+  cv <- fread(cv_path)
+  best <- cv[which.max(mean_skill)]  # select by mean_skill
+  
+  cat("\n=== Selected by MEAN SKILL ===\n")
+  print(best)
+  
+  df_best <- fread(df_path)
+  if (!"State.ANSI" %in% names(df_best)) df_best[, State.ANSI := as.integer(fips %/% 1000L)]
+  if (!"t" %in% names(df_best)) {
+    t0 <- mean(df_best$year, na.rm = TRUE)
+    df_best[, t := year - t0]
   }
+  
+  fml <- make_selected_formula(best$n_stages, best$hdd, best$ppt, names(df_best))
+  mod <- feols(fml, data = df_best, cluster = ~ year)
+  
+  cat("\n=== Final model (selected by mean skill) ===\n")
+  print(summary(mod))
+  invisible(mod)
 }
 
-# =========================
-# RUN FOR THE THREE OILSEEDS
-# =========================
-for (crop in c("sunflower","canola","flaxseed")) {
-  yfile <- file.path(root, sprintf("%s_yields.csv", crop))
-  if (!file.exists(yfile)) {
-    cat(sprintf("\n-- %s yields not found: %s (skipping) --\n", toupper(crop), yfile))
-    next
-  }
-  yld_raw <- load_outcome(yfile, years_use)
-  run_pipeline(yld_raw, label = tools::toTitleCase(crop))
+# -----------------------------
+# Run for all three crops
+# -----------------------------
+for (crop in c("sunflower", "canola", "flaxseed")) {
+  cat(sprintf("\n\n########## %s ##########\n", toupper(crop)))
+  refit_best_mean(crop)
 }
+
